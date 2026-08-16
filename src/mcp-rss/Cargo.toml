@@ -1,6 +1,6 @@
 [package]
 name = "mcp-rss"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server that provides RSS tooling."
 repository = "https://github.com/haras-unicorn/mcp-rss"
 authors = ["haras-unicorn <github@haras-unicorn.net>"]
