@@ -13,7 +13,8 @@
 
 use readabilityrs::{Readability, ReadabilityOptions};
 use rmcp::{
-  Json, handler::server::wrapper::Parameters, schemars, tool, tool_router,
+  ErrorData, Json, handler::server::wrapper::Parameters, schemars, tool,
+  tool_router,
 };
 use scraper::Html;
 use std::time::Duration;
@@ -113,17 +114,22 @@ impl RssServer {
   async fn get_articles(
     &self,
     Parameters(input): Parameters<GetArticlesInput>,
-  ) -> Json<GetArticlesOutput> {
+  ) -> Result<Json<GetArticlesOutput>, ErrorData> {
     if input.feeds.is_empty() {
-      return Json(GetArticlesOutput { articles: vec![] });
+      return Err(ErrorData::invalid_params(
+        "no feeds provided; the 'feeds' argument must contain at least one URL",
+        None,
+      ));
     }
 
     let parsed_time = if let Some(ref iso) = input.time_from {
       match chrono::DateTime::parse_from_rfc3339(iso) {
         Ok(dt) => Some(dt),
         Err(e) => {
-          eprintln!("Invalid ISO 8601 timestamp: {e}");
-          None
+          return Err(ErrorData::invalid_params(
+            format!("invalid ISO 8601 'time_from' value {iso:?}: {e}"),
+            None,
+          ));
         }
       }
     } else {
@@ -139,13 +145,17 @@ impl RssServer {
           Ok(resp) => match resp.text().await {
             Ok(text) => text,
             Err(e) => {
-              eprintln!("Failed to fetch feed {}: {}", feed_url, e);
-              continue;
+              return Err(ErrorData::internal_error(
+                format!("failed to read feed {feed_url}: {e}"),
+                None,
+              ));
             }
           },
           Err(e) => {
-            eprintln!("Failed to connect to feed {}: {}", feed_url, e);
-            continue;
+            return Err(ErrorData::internal_error(
+              format!("failed to connect to feed {feed_url}: {e}"),
+              None,
+            ));
           }
         }
       };
@@ -153,8 +163,10 @@ impl RssServer {
       let feed = match rss::Channel::read_from(feed_content.as_bytes()) {
         Ok(channel) => channel,
         Err(e) => {
-          eprintln!("Failed to parse feed {}: {}", feed_url, e);
-          continue;
+          return Err(ErrorData::internal_error(
+            format!("feed {feed_url} could not be parsed as RSS/Atom: {e}"),
+            None,
+          ));
         }
       };
 
@@ -190,7 +202,7 @@ impl RssServer {
     let mut seen = std::collections::HashSet::new();
     articles.retain(|a| seen.insert(a.link.clone()));
 
-    Json(GetArticlesOutput { articles })
+    Ok(Json(GetArticlesOutput { articles }))
   }
 
   /// Fetch the content of a single article from a URL.
@@ -203,24 +215,28 @@ impl RssServer {
   async fn fetch_article(
     &self,
     Parameters(input): Parameters<FetchArticleInput>,
-  ) -> Json<FetchArticleOutput> {
+  ) -> Result<Json<FetchArticleOutput>, ErrorData> {
+    if input.url.trim().is_empty() {
+      return Err(ErrorData::invalid_params("no URL provided", None));
+    }
+
     let html = {
       let http = &self.http;
       match http.get(&input.url).send().await {
         Ok(resp) => match resp.text().await {
           Ok(text) => text,
           Err(e) => {
-            eprintln!("Failed to fetch {}: {}", input.url, e);
-            return Json(FetchArticleOutput {
-              content: format!("Failed to fetch: {e}"),
-            });
+            return Err(ErrorData::internal_error(
+              format!("failed to read {url}: {e}", url = input.url),
+              None,
+            ));
           }
         },
         Err(e) => {
-          eprintln!("Failed to connect to {}: {}", input.url, e);
-          return Json(FetchArticleOutput {
-            content: format!("Failed to connect: {e}"),
-          });
+          return Err(ErrorData::internal_error(
+            format!("failed to connect to {url}: {e}", url = input.url),
+            None,
+          ));
         }
       }
     };
@@ -237,9 +253,9 @@ impl RssServer {
     .map(|article| article.parse())
     {
       if let Some(markdown) = article.markdown_content {
-        return Json(FetchArticleOutput { content: markdown });
+        return Ok(Json(FetchArticleOutput { content: markdown }));
       } else if let Some(text) = article.text_content {
-        return Json(FetchArticleOutput { content: text });
+        return Ok(Json(FetchArticleOutput { content: text }));
       }
     }
 
@@ -273,7 +289,14 @@ impl RssServer {
     // Clean up whitespace
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    Json(FetchArticleOutput { content: text })
+    if text.trim().is_empty() {
+      return Err(ErrorData::internal_error(
+        format!("could not extract any content from {url}", url = input.url),
+        None,
+      ));
+    }
+
+    Ok(Json(FetchArticleOutput { content: text }))
   }
 }
 
@@ -286,6 +309,7 @@ fn strip_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use rmcp::model::ErrorCode;
   use wiremock::{Mock, MockServer, ResponseTemplate};
 
   fn make_server() -> RssServer {
@@ -337,7 +361,10 @@ mod tests {
       feeds: vec![format!("{}/feed.xml", mock_server.uri())],
       time_from: None,
     };
-    let result = server.get_articles(Parameters(input)).await;
+    let result = server
+      .get_articles(Parameters(input))
+      .await
+      .expect("get_articles should succeed");
     let articles = &result.0.articles;
 
     assert_eq!(articles.len(), 2);
@@ -374,7 +401,10 @@ mod tests {
       feeds: vec![format!("{}/feed.xml", mock_server.uri())],
       time_from: Some("2026-01-01T00:00:00+00:00".to_string()),
     };
-    let result = server.get_articles(Parameters(input)).await;
+    let result = server
+      .get_articles(Parameters(input))
+      .await
+      .expect("get_articles should succeed");
     let articles = &result.0.articles;
 
     // "Old" is before the filter date — excluded
@@ -438,7 +468,10 @@ mod tests {
       ],
       time_from: None,
     };
-    let result = server.get_articles(Parameters(input)).await;
+    let result = server
+      .get_articles(Parameters(input))
+      .await
+      .expect("get_articles should succeed");
 
     // Each feed has 2 items, but they're the same URLs — should deduplicate to 2
     assert_eq!(result.0.articles.len(), 2);
@@ -461,7 +494,11 @@ mod tests {
       time_from: None,
     };
     let result = server.get_articles(Parameters(input)).await;
-    assert!(result.0.articles.is_empty());
+    let Err(error) = result else {
+      panic!("get_articles should fail on unparsable XML");
+    };
+    assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+    assert!(!error.message.is_empty());
   }
 
   #[tokio::test]
@@ -472,7 +509,10 @@ mod tests {
       time_from: None,
     };
     let result = server.get_articles(Parameters(input)).await;
-    assert!(result.0.articles.is_empty());
+    let Err(error) = result else {
+      panic!("get_articles should reject an empty feed list");
+    };
+    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
   }
 
   // --- fetch_article ---
@@ -496,7 +536,10 @@ mod tests {
     let input = FetchArticleInput {
       url: format!("{}/article.html", mock_server.uri()),
     };
-    let result = server.fetch_article(Parameters(input)).await;
+    let result = server
+      .fetch_article(Parameters(input))
+      .await
+      .expect("fetch_article should succeed");
 
     assert!(result.0.content.contains("Article Title"));
     assert!(result.0.content.contains("main article content"));
@@ -522,7 +565,10 @@ mod tests {
     let input = FetchArticleInput {
       url: format!("{}/blog.html", mock_server.uri()),
     };
-    let result = server.fetch_article(Parameters(input)).await;
+    let result = server
+      .fetch_article(Parameters(input))
+      .await
+      .expect("fetch_article should succeed");
 
     assert!(result.0.content.contains("Blog Post"));
     assert!(result.0.content.contains("Blog post body text"));
@@ -547,7 +593,10 @@ mod tests {
     let input = FetchArticleInput {
       url: format!("{}/plain.html", mock_server.uri()),
     };
-    let result = server.fetch_article(Parameters(input)).await;
+    let result = server
+      .fetch_article(Parameters(input))
+      .await
+      .expect("fetch_article should succeed");
 
     assert!(result.0.content.contains("all there is"));
     assert!(result.0.content.contains("plain content"));
